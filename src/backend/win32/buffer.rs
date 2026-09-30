@@ -108,7 +108,14 @@ impl<T> IoBuffer<T> {
         match result {
             Ok(()) => Ok(Some(bytes_transferred as usize)),
             Err(err) if err.code() == HRESULT::from_win32(ERROR_IO_INCOMPLETE.0) => Ok(None),
-            Err(err) => Err(err.into())
+            Err(err) => {
+                // Any other error means the operation has completed, just unsuccessfully
+                // (e.g. the device was disconnected). Nothing is pending anymore, so the next
+                // operation must be allowed to start instead of tripping the assertion in
+                // `start_io`.
+                self.pending = false;
+                Err(err.into())
+            }
         }
     }
 }

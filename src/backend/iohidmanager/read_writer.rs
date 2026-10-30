@@ -15,7 +15,7 @@ use log::{error, trace};
 use objc2_core_foundation::{CFIndex, CFNumber, CFRetained};
 use objc2_io_kit::{kIOHIDMaxInputReportSizeKey, kIOReturnSuccess, IOHIDDevice, IOHIDReportType, IOOptionBits, IOReturn};
 
-use crate::backend::iohidmanager::context::CallbackContext;
+use crate::backend::iohidmanager::context::{not_permitted, CallbackContext, NOT_PERMITTED};
 use crate::backend::iohidmanager::device_info::property_key;
 use crate::{ensure, AsyncHidFeatureHandle, AsyncHidRead, AsyncHidWrite, HidError, HidResult};
 
@@ -211,6 +211,7 @@ impl DeviceReadWriter {
         } {
             kIOReturnSuccess => Ok(()),
             kIOReturnBadArgument => Err(HidError::Disconnected),
+            NOT_PERMITTED => Err(not_permitted()),
             other => Err(HidError::message(format!("failed to set report type: {:#X}", other))),
         }?;
 

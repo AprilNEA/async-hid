@@ -13,7 +13,7 @@ use atomic_waker::AtomicWaker;
 use log::trace;
 
 use crate::{HidError, HidResult};
-use objc2_io_kit::{kIOReturnBadArgument, kIOReturnSuccess};
+use objc2_io_kit::{kIOReturnBadArgument, kIOReturnNotPermitted, kIOReturnSuccess};
 
 /// Inner context passed to the callback. This is wrapped in an Arc,
 /// so it maintains a stable pointer between the future and the callback.
@@ -98,6 +98,24 @@ impl<Result> Drop for CallbackContext<Result> {
 /// the constant is unsigned, the return code is read as signed.
 const BAD_ARGUMENT: i32 = kIOReturnBadArgument as i32;
 
+/// `kIOReturnNotPermitted` (`0xE00002E2`), read as signed like [`BAD_ARGUMENT`].
+pub(crate) const NOT_PERMITTED: i32 = kIOReturnNotPermitted as i32;
+
+/// The kernel's HID user client refused a report transfer on a handle that
+/// opened fine. `IOHIDLibUserClient` answers `kIOReturnNotPermitted` only
+/// while it holds the client invalid: for a device whose primary usage is a
+/// keyboard, while another process holds Secure Event Input (or the session
+/// is off the console); for any other device, while the session is off the
+/// console. It revalidates on its own when that state changes, so this is
+/// neither a disconnect nor a missing Input Monitoring grant — surfaced as
+/// [`std::io::ErrorKind::PermissionDenied`] so callers can tell it apart.
+pub(crate) fn not_permitted() -> HidError {
+    HidError::from_backend(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "macOS refused the HID report transfer (kIOReturnNotPermitted 0xE00002E2)",
+    ))
+}
+
 impl<R: Copy> Future for CallbackContext<R> {
     type Output = HidResult<Option<R>>;
 
@@ -119,6 +137,7 @@ impl<R: Copy> Future for CallbackContext<R> {
             // IOKit answers a device that has gone away with a bad argument.
             // Mapped here rather than at one call site, so reads get it too.
             BAD_ARGUMENT => Err(HidError::Disconnected),
+            NOT_PERMITTED => Err(not_permitted()),
             other => Err(HidError::message(format!("report callback error: {:#X}", other))),
         })
     }
@@ -154,6 +173,24 @@ mod tests {
         inner.done.store(true, Ordering::Release);
 
         assert!(matches!(block_on(context), Err(HidError::Disconnected)));
+    }
+
+    #[test]
+    fn not_permitted_is_reported_as_permission_denied() {
+        let context = CallbackContext::<()>::new();
+        let inner = context.inner();
+
+        inner.ret.store(NOT_PERMITTED, Ordering::Relaxed);
+        inner.done.store(true, Ordering::Release);
+
+        let Err(HidError::Other(source)) = block_on(context) else {
+            panic!("expected a backend error");
+        };
+        let io = source
+            .downcast_ref::<std::io::Error>()
+            .expect("an io::Error source");
+        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(io.to_string().contains("0xE00002E2"));
     }
 
     #[test]

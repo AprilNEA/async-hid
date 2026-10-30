@@ -58,7 +58,6 @@ impl<T> IoBuffer<T> {
                 match self.get_result()? {
                     Some(size) => {
                         trace!("Completed write operation (transferred {} bytes)", size);
-                        self.pending = false;
                         return Ok(());
                     }
                     None => self.overlapped.wait_for_completion().await?
@@ -73,23 +72,11 @@ impl<T> IoBuffer<T> {
         F: FnOnce(&Device, &mut [u8], &mut Overlapped) -> windows::core::Result<()>
     {
         assert!(!self.pending, "I/O operation already pending");
-        let result = operation(&self.device, &mut self.buffer, &mut self.overlapped);
-        match result {
-            Ok(_) => {
-                self.pending = true;
-            }
-            Err(err) if err.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => {
-                self.pending = true;
-            }
-            Err(err) => {
-                if let Err(err) = self.cancel_io() {
-                    self.pending = true;
-                    panic!("Failed to cancel I/O operation: {:?}", err);
-                } else {
-                    self.pending = false;
-                }
-                return Err(err.into());
-            }
+        let r = operation(&self.device, &mut self.buffer, &mut self.overlapped);
+        self.pending = true;
+        if let Err(e) = r && e.code() != HRESULT::from_win32(ERROR_IO_PENDING.0) {
+            self.cancel_io().expect("Failed to cancel I/O operation");
+            return Err(e.into())
         }
         Ok(())
     }
@@ -99,16 +86,22 @@ impl<T> IoBuffer<T> {
             Ok(()) => Ok(()),
             Err(err) if err.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0) => Ok(()),
             Err(err) => Err(err.into())
-        }
+        }.inspect(|_| self.pending = false)
     }
 
     fn get_result(&mut self) -> HidResult<Option<usize>> {
         let mut bytes_transferred = 0;
         let result = unsafe { GetOverlappedResult(self.device.handle(), self.overlapped.as_raw(), &mut bytes_transferred, false) };
         match result {
-            Ok(()) => Ok(Some(bytes_transferred as usize)),
+            Ok(()) => {
+                self.pending = false;
+                Ok(Some(bytes_transferred as usize))
+            }
             Err(err) if err.code() == HRESULT::from_win32(ERROR_IO_INCOMPLETE.0) => Ok(None),
-            Err(err) => Err(err.into())
+            Err(err) => {
+                self.pending = false;
+                Err(err.into())
+            }
         }
     }
 }
@@ -159,7 +152,6 @@ impl IoBuffer<Readable> {
                             copy_len = buf.len();
                         }
                         buf[..copy_len].copy_from_slice(&data[..copy_len]);
-                        self.pending = false;
                         return Ok(copy_len);
                     }
                     None => self.overlapped.wait_for_completion().await?
@@ -250,7 +242,6 @@ impl IoBuffer<Feature> {
                         let data = &self.buffer[..size];
                         let copy_len = std::cmp::min(data.len(), buf.len());
                         buf[..copy_len].copy_from_slice(&data[..copy_len]);
-                        self.pending = false;
                         return Ok(copy_len);
                     }
                     None => self.overlapped.wait_for_completion().await?
@@ -322,3 +313,46 @@ impl Drop for Overlapped {
         unsafe { CloseHandle(inner.hEvent).unwrap_or_else(|err| warn!("Failed to close handle: {err}")) };
     }
 }
+
+/*
+TODO: Figure out how to make the buffer logic mockable so that we can write tests against it
+#[cfg(test)]
+mod tests {
+    use windows::Win32::Foundation::{ERROR_GEN_FAILURE, ERROR_IO_INCOMPLETE, ERROR_NO_SUCH_DEVICE, WIN32_ERROR};
+
+    use super::*;
+
+    fn win32_error(code: WIN32_ERROR) -> windows::core::Error {
+        windows::core::Error::from_hresult(HRESULT::from_win32(code.0))
+    }
+
+    #[test]
+    fn incomplete_result_keeps_operation_pending() {
+        let mut pending = true;
+        let result = classify_io_result(&mut pending, Err(win32_error(ERROR_IO_INCOMPLETE)), 0);
+
+        assert!(matches!(result, Ok(None)));
+        assert!(pending);
+    }
+
+    #[test]
+    fn terminal_errors_clear_operation_pending() {
+        for error in [ERROR_NO_SUCH_DEVICE, ERROR_GEN_FAILURE] {
+            let mut pending = true;
+            let result = classify_io_result(&mut pending, Err(win32_error(error)), 0);
+
+            assert!(result.is_err());
+            assert!(!pending);
+        }
+    }
+
+    #[test]
+    fn successful_result_clears_operation_pending() {
+        let mut pending = true;
+        let result = classify_io_result(&mut pending, Ok(()), 17);
+
+        assert!(matches!(result, Ok(Some(17))));
+        assert!(!pending);
+    }
+}
+ */

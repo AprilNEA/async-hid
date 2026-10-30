@@ -10,7 +10,7 @@ use std::task::Poll;
 use atomic_waker::AtomicWaker;
 use block2::RcBlock;
 use crossbeam_queue::ArrayQueue;
-use dispatch2::{DispatchQoS, DispatchQueue, GlobalQueueIdentifier};
+use dispatch2::{DispatchQoS, DispatchQueue, DispatchQueueAttr, DispatchRetained, GlobalQueueIdentifier};
 use log::{error, trace};
 use objc2_core_foundation::{CFIndex, CFNumber, CFRetained};
 use objc2_io_kit::{kIOHIDMaxInputReportSizeKey, kIOReturnSuccess, IOHIDDevice, IOHIDReportType, IOOptionBits, IOReturn};
@@ -33,11 +33,23 @@ struct ReaderState {
     report_buffer: ManuallyDrop<Vec<u8>>,
 }
 
-struct WriterState;
+struct WriterState {
+    /// Writes for one device are serialized and ordered, and the queue the
+    /// device delivers its input reports on is never blocked by one.
+    queue: DispatchRetained<DispatchQueue>,
+}
 
-/// The device handle, moved into a dispatch block. `DeviceReadWriter` already
-/// asserts `Send` for the very same handle just below; the block runs on a queue
-/// of our own choosing and only calls a thread safe IOKit function on it.
+/// A device handle that may be moved to another thread.
+///
+/// # Safety
+///
+/// Two things make this sound. CoreFoundation reference counts are atomic, so
+/// retaining and releasing an `IOHIDDevice` from a dispatch worker is defined,
+/// including the case where the block holds the last reference because the
+/// `DeviceReadWriter` was dropped while the write was still queued. And
+/// `IOHIDDeviceSetReport`, the only thing called through this handle, is
+/// synchronous and carries no run loop or queue affinity, unlike the
+/// callback-driven calls, which belong to the queue the device was attached to.
 struct SendDevice(CFRetained<IOHIDDevice>);
 unsafe impl Send for SendDevice {}
 
@@ -100,7 +112,14 @@ impl DeviceReadWriter {
             }
         });
 
-        let write_state = write.then_some(WriterState);
+        let write_state = write.then(|| {
+            // Targeted at a user initiated global queue rather than given a
+            // QoS floor afterwards: the floor may only be set while the object
+            // is still inactive, and a queue from `new` is already active.
+            let target = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(DispatchQoS::UserInitiated));
+            let queue = DispatchQueue::new_with_target("async-hid-write", DispatchQueueAttr::SERIAL, Some(&target));
+            WriterState { queue }
+        });
 
         device.activate();
 
@@ -113,26 +132,19 @@ impl DeviceReadWriter {
 
     /// Common function to write reports from the specified [`IOHIDReportType`]
     async fn write_report<'a>(&'a self, report_type: IOHIDReportType, buf: &'a [u8]) -> HidResult<()> {
-        #[allow(non_upper_case_globals)]
-        const kIOReturnBadArgument: IOReturn = objc2_io_kit::kIOReturnBadArgument as IOReturn;
-
-        let _ = self.write_state.as_ref().expect("Device is not writable");
+        let write_state = self.write_state.as_ref().expect("Device is not writable");
         let report_id = buf[0];
         let data_to_send = if report_id == 0x0 { &buf[1..] } else { buf };
 
-        // IOHIDDeviceSetReportWithCallback is deliberately not used. On macOS it
-        // stops input report delivery for the device after a few hundred calls,
-        // and nothing on this side prevents that. The synchronous SetReport does
-        // not, so it runs on a global queue and is awaited: the signature stays
-        // asynchronous and no executor thread is blocked. What is blocked is one
-        // worker of the global queue, for as long as the write takes.
+        // The synchronous SetReport runs on the device's own serial queue and is
+        // awaited, so the signature stays asynchronous and no executor thread is
+        // blocked. IOHIDDeviceSetReportWithCallback is deliberately not used: on
+        // macOS it stops input report delivery after a few hundred calls.
         //
-        // It has to be a global queue rather than DISPATCH_QUEUE: that one is
-        // serial and is the queue the device delivers its input reports on, so
-        // occupying it for the duration of a write would stall every read.
+        // There is no timeout. SetReport offers none, and a crate that does not
+        // pick a runtime has no timer of its own to race it against.
         let context = CallbackContext::<()>::new();
         let inner = context.inner();
-        let inner_for_error = inner.clone();
 
         // The block outlives this frame as far as the type system knows, so it
         // gets owned copies. IOKit only reads the report, and owning it is what
@@ -140,10 +152,8 @@ impl DeviceReadWriter {
         let data = data_to_send.to_vec();
         let device = SendDevice(self.device.clone());
 
-        DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(DispatchQoS::Default)).exec_async(move || {
-            // Rebinding captures the wrapper. Without it the closure captures
-            // the CFRetained field on its own, which is not Send, and this
-            // stops compiling. Not redundant.
+        write_state.queue.exec_async(move || {
+            // Force whole-struct capture (edition 2021+ disjoint capture).
             let device = device;
             let ret = unsafe {
                 device.0.set_report(
@@ -154,7 +164,10 @@ impl DeviceReadWriter {
                 )
             };
             inner.ret.store(ret, Ordering::Relaxed);
-            inner.done.store(true, Ordering::Relaxed);
+            // Release, so the return code above is visible to the acquiring
+            // load in poll. Without it a completed write can be seen before the
+            // code it completed with, and a failure reads as success.
+            inner.done.store(true, Ordering::Release);
             // The cancelled flag is not consulted. It exists so a C callback
             // knows to drop the Arc it was handed raw; this block holds an
             // ordinary one, so signalling a future that is already gone
@@ -162,14 +175,7 @@ impl DeviceReadWriter {
             inner.waker.wake();
         });
 
-        // The old code mapped a bad argument onto Disconnected; keep that.
-        context.await.map(|_| ()).map_err(|err| {
-            #[allow(non_upper_case_globals)]
-            match inner_for_error.ret.load(Ordering::Relaxed) {
-                kIOReturnBadArgument => HidError::Disconnected,
-                _ => err,
-            }
-        })
+        context.await.map(|_| ())
     }
 
     /// Common function to read reports from the specified [`IOHIDReportType`]
@@ -315,10 +321,10 @@ impl AsyncReportReaderInner {
         context: *mut c_void, _result: IOReturn, _sender: *mut c_void, _report_type: IOHIDReportType, _report_id: u32, report: NonNull<u8>,
         report_length: CFIndex,
     ) {
-        let this: &Self = &*(context as *mut Self);
+        let this: &Self = unsafe { &*(context as *mut Self) };
         let mut buffer = this.empty_buffers.pop().unwrap_or_default();
         buffer.resize(report_length as usize, 0);
-        buffer.copy_from_slice(from_raw_parts(report.as_ptr(), report_length as usize));
+        buffer.copy_from_slice(unsafe { from_raw_parts(report.as_ptr(), report_length as usize) });
         if let Some(old) = this.full_buffers.force_push(buffer) {
             this.recycle_buffer(old);
         }
@@ -326,7 +332,7 @@ impl AsyncReportReaderInner {
     }
 
     unsafe extern "C-unwind" fn hid_removal_callback(context: *mut c_void, _result: IOReturn, _sender: *mut c_void) {
-        let this: &Self = &*(context as *mut Self);
+        let this: &Self = unsafe { &*(context as *mut Self) };
         this.removed.store(true, Ordering::Relaxed);
         this.waker.wake();
     }
@@ -358,8 +364,9 @@ impl AsyncReaderCallback {
         // Set the return result
         context.ret.store(result, Ordering::Relaxed);
 
-        // Mark the callback done
-        context.done.store(true, Ordering::Relaxed);
+        // Mark the callback done. Release for the same reason as in the write
+        // path: it publishes the return code stored just above.
+        context.done.store(true, Ordering::Release);
 
         context.waker.wake();
 

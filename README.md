@@ -2,11 +2,12 @@
 
 The OpenLogi-maintained fork of [async-hid](https://github.com/sidit77/async-hid), a Rust library for asynchronously interacting with HID devices.
 
-Version `0.5.3-openlogi.1` is based on upstream `0.5.3` and includes the macOS report-write fix from [upstream PR #46](https://github.com/sidit77/async-hid/pull/46). The package keeps the `async_hid` Rust library name, so downstream users can adopt it without source changes:
+Version `0.5.3-openlogi.2` is upstream `main` at `c32f3e8`: the `0.5.3` release plus the macOS report-write fix from [upstream PR #46](https://github.com/sidit77/async-hid/pull/46) and the Win32 interrupted-write recovery from [upstream PR #48](https://github.com/sidit77/async-hid/pull/48) (a write that failed while the device was away no longer leaves the buffer pending, so the next write returns an error instead of panicking). The package keeps the `async_hid` Rust library name, so downstream users can adopt it without source changes:
 
 ```toml
-async-hid = { package = "openlogi-async-hid", version = "=0.5.3-openlogi.1" }
+async-hid = { package = "openlogi-async-hid", version = "=0.5.3-openlogi.2" }
 ```
+
 
 This crate aims to be a replacement for [hidapi-rs](https://github.com/ruabmbua/hidapi-rs) without the baggage that comes from being a wrapper around a C library.
 
@@ -14,22 +15,23 @@ This crate generally offers a simpler and more streamlined api while also suppor
 
 ## Example
 
-```rust
-use async_hid::{AccessMode, DeviceInfo, HidResult};
-use simple_logger::SimpleLogger;
+```rust,no_run
+use async_hid::{AsyncHidRead, AsyncHidWrite, Device, HidBackend, HidResult};
 use futures_lite::StreamExt;
+use simple_logger::SimpleLogger;
 
 #[pollster::main]
 async fn main() -> HidResult<()> {
     SimpleLogger::new().init().unwrap();
 
-    let device = DeviceInfo::enumerate()
+    let mut device = HidBackend::default()
+        .enumerate()
         .await?
         //Steelseries Arctis Nova 7X headset
-        .find(|info: &DeviceInfo | info.matches(0xFFC0, 0x1, 0x1038, 0x2206))
+        .find(|info: &Device| info.matches(0xFFC0, 0x1, 0x1038, 0x2206))
         .await
         .expect("Could not find device")
-        .open(AccessMode::ReadWrite)
+        .open()
         .await?;
 
     device.write_output_report(&[0x0, 0xb0]).await?;
@@ -48,6 +50,7 @@ async fn main() -> HidResult<()> {
 | Windows          | Win32 (`Windows.Win32.Devices`)                |
 | Windows          | WinRT (`Windows.Devices.HumanInterfaceDevice`) |
 | Linux            | hidraw                                         |
+| FreeBSD          | hidraw                                         |
 | MacOs            | IOHIDManager                                   |
 
 Under Windows this crate uses either `win32` (default) or `winrt` feature for backend.
@@ -61,9 +64,20 @@ The amount of asynchronicity that each OS provides varies. The following table g
 | Windows (Win32) | ❌️           | ️️ ❌️    | ✔️                  | ✔️                    |
 | Windows (WinRT) | ✔️           | ✔️     | ✔️                  | ✔️                    |
 | Linux           | ❌            | ❌      | ✔️                  | ✔️                    |
+| FreeBSD         | ❌            | ❌      | ✔️                  | ✔️                    |
 | MacOS           | ❌            | ✔️     | ✔️                  | ✔️                     |
 
-Under Linux this crate uses either `async-io` (default) or `tokio` feature for the async functionality. 
+Under Linux this crate uses either `async-io` (default) or `tokio` feature for the async functionality.
+
+Under FreeBSD this crate likewise uses either `async-io` (default) or `tokio`. Note that FreeBSD's `hidraw(4)`
+implements only the `EVFILT_READ` kqueue filter and rejects `EVFILT_WRITE`, so the tokio backend registers
+descriptors with read interest only and performs writes directly. This is sound because writes to a hidraw node
+never block: `hidraw_write()` calls `hid_write()` synchronously and `hidraw_poll()` already reports `POLLOUT`
+unconditionally.
+
+FreeBSD additionally requires the `hidraw` kernel module (`hidraw_load="YES"` in `loader.conf`),
+`hw.usb.usbhid.enable=1`, and read access to `/dev/hidraw*` (`0600 root:operator` by default, so add a
+`devfs.rules(5)` entry or join the `operator` group).
 
 ## Planned Features
 - Redesign how feature reads and write are integrated exposed.

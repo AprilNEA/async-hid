@@ -10,17 +10,19 @@ use std::task::Poll;
 use atomic_waker::AtomicWaker;
 use block2::RcBlock;
 use crossbeam_queue::ArrayQueue;
-use dispatch2::{DispatchQoS, DispatchQueue, DispatchQueueAttr, DispatchRetained, GlobalQueueIdentifier};
+use dispatch2::{DispatchQoS, DispatchQueue, DispatchRetained, GlobalQueueIdentifier};
 use log::{error, trace};
 use objc2_core_foundation::{CFIndex, CFNumber, CFRetained};
 use objc2_io_kit::{kIOHIDMaxInputReportSizeKey, kIOReturnSuccess, IOHIDDevice, IOHIDReportType, IOOptionBits, IOReturn};
 
 use crate::backend::iohidmanager::context::CallbackContext;
 use crate::backend::iohidmanager::device_info::property_key;
+use crate::backend::iohidmanager::{serial_queue, with_pool};
 use crate::{ensure, AsyncHidFeatureHandle, AsyncHidRead, AsyncHidWrite, HidError, HidResult};
 
 pub struct DeviceReadWriter {
-    device: CFRetained<IOHIDDevice>,
+    /// Released last, inside the pool `Drop` runs in.
+    device: ManuallyDrop<CFRetained<IOHIDDevice>>,
     read_state: Option<ReaderState>,
     write_state: Option<WriterState>,
 }
@@ -60,6 +62,12 @@ impl DeviceReadWriter {
     pub const DEVICE_OPTIONS: IOOptionBits = 0;
 
     pub fn new(device: CFRetained<IOHIDDevice>, dispatch_queue: &DispatchQueue, read: bool, write: bool) -> HidResult<Self> {
+        // Registering the input report callback autoreleases the device's
+        // element tree; see `with_pool`.
+        with_pool(|| Self::open(device, dispatch_queue, read, write))
+    }
+
+    fn open(device: CFRetained<IOHIDDevice>, dispatch_queue: &DispatchQueue, read: bool, write: bool) -> HidResult<Self> {
         if read || write {
             ensure!(
                 device.open(DeviceReadWriter::DEVICE_OPTIONS) == kIOReturnSuccess,
@@ -117,14 +125,14 @@ impl DeviceReadWriter {
             // QoS floor afterwards: the floor may only be set while the object
             // is still inactive, and a queue from `new` is already active.
             let target = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(DispatchQoS::UserInitiated));
-            let queue = DispatchQueue::new_with_target("async-hid-write", DispatchQueueAttr::SERIAL, Some(&target));
+            let queue = serial_queue("async-hid-write", Some(&target));
             WriterState { queue }
         });
 
         device.activate();
 
         Ok(Self {
-            device,
+            device: ManuallyDrop::new(device),
             read_state,
             write_state,
         })
@@ -150,19 +158,26 @@ impl DeviceReadWriter {
         // gets owned copies. IOKit only reads the report, and owning it is what
         // makes a future dropped mid write cost a wasted write and nothing else.
         let data = data_to_send.to_vec();
-        let device = SendDevice(self.device.clone());
+        let device = SendDevice(CFRetained::clone(&self.device));
 
         write_state.queue.exec_async(move || {
             // Force whole-struct capture (edition 2021+ disjoint capture).
             let device = device;
-            let ret = unsafe {
-                device.0.set_report(
-                    report_type,
-                    report_id as _,
-                    NonNull::new_unchecked(data.as_ptr() as *mut u8),
-                    data.len() as _,
-                )
-            };
+            // This block may hold the last reference to the device, when the
+            // `DeviceReadWriter` was dropped while the write was queued, so the
+            // release happens inside the pool along with the write.
+            let ret = with_pool(move || {
+                let ret = unsafe {
+                    device.0.set_report(
+                        report_type,
+                        report_id as _,
+                        NonNull::new_unchecked(data.as_ptr() as *mut u8),
+                        data.len() as _,
+                    )
+                };
+                drop(device);
+                ret
+            });
             inner.ret.store(ret, Ordering::Relaxed);
             // Release, so the return code above is visible to the acquiring
             // load in poll. Without it a completed write can be seen before the
@@ -198,7 +213,7 @@ impl DeviceReadWriter {
         let mut length: CFIndex = buffer.len() as _;
 
         #[allow(non_upper_case_globals)]
-        match unsafe {
+        match with_pool(|| unsafe {
             self.device.report_with_callback(
                 report_type,
                 report_id as _,
@@ -208,7 +223,7 @@ impl DeviceReadWriter {
                 Some(AsyncReaderCallback::read_callback),
                 NonNull::new_unchecked(context.as_raw() as *mut _),
             )
-        } {
+        }) {
             kIOReturnSuccess => Ok(()),
             kIOReturnBadArgument => Err(HidError::Disconnected),
             other => Err(HidError::message(format!("failed to set report type: {:#X}", other))),
@@ -267,6 +282,12 @@ impl ReaderState {
 
 impl Drop for DeviceReadWriter {
     fn drop(&mut self) {
+        with_pool(|| self.release());
+    }
+}
+
+impl DeviceReadWriter {
+    fn release(&mut self) {
         unsafe {
             {
                 let once = Arc::new(Once::new());
@@ -290,6 +311,9 @@ impl Drop for DeviceReadWriter {
             }
 
             self.device.close(Self::DEVICE_OPTIONS);
+
+            //SAFETY: Dropped exactly once, here, and never touched again.
+            ManuallyDrop::drop(&mut self.device);
         }
     }
 }

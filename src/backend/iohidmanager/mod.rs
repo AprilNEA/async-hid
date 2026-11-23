@@ -4,6 +4,7 @@ mod read_writer;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 use std::pin::Pin;
 use std::ptr::{null, NonNull};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +14,7 @@ use std::task::{Context, Poll};
 use atomic_waker::AtomicWaker;
 use block2::RcBlock;
 use crossbeam_queue::ArrayQueue;
-use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
+use dispatch2::{DispatchAutoReleaseFrequency, DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use futures_lite::stream::{iter, Boxed};
 use futures_lite::{Stream, StreamExt};
 use log::{debug, trace, warn};
@@ -26,7 +27,34 @@ use crate::backend::{Backend, DeviceInfoStream};
 use crate::utils::TryIterExt;
 use crate::{ensure, DeviceEvent, DeviceId, DeviceInfo, HidError, HidResult};
 
-static DISPATCH_QUEUE: LazyLock<DispatchRetained<DispatchQueue>> = LazyLock::new(|| DispatchQueue::new("async-hid", DispatchQueueAttr::SERIAL));
+/// The queue IOKit delivers this crate's callbacks on.
+static DISPATCH_QUEUE: LazyLock<DispatchRetained<DispatchQueue>> = LazyLock::new(|| serial_queue("async-hid", None));
+
+/// A serial queue that drains an autorelease pool after every block.
+///
+/// A queue created with the default attributes inherits its target's
+/// behaviour, and a global queue never drains one per block, so whatever IOKit
+/// autoreleases inside its own blocks (report delivery, cancellation,
+/// teardown) would otherwise wait for a drain that never comes.
+pub(crate) fn serial_queue(label: &str, target: Option<&DispatchQueue>) -> DispatchRetained<DispatchQueue> {
+    let attr = DispatchQueueAttr::with_autorelease_frequency(DispatchQueueAttr::SERIAL, DispatchAutoReleaseFrequency::WORK_ITEM);
+    DispatchQueue::new_with_target(label, Some(&attr), target)
+}
+
+/// Runs `f` inside an autorelease pool and drains it on return.
+///
+/// IOKit's HID calls autorelease Objective-C objects behind the C API. The
+/// largest is the device's whole element tree (one `HIDElement` and one
+/// `HIDLibElement` per element), which registering an input report callback
+/// autoreleases on every open. A pool only drains on a thread that has one:
+/// the main thread under AppKit does, but the executor threads this crate is
+/// called from do not, and neither do blocks on queues that inherit a global
+/// queue's never-drain behaviour. Without a pool here every open leaks the
+/// tree for good, which a caller that reopens a device on a timer turns into
+/// gigabytes. Every entry point that calls into IOKit goes through this.
+pub(crate) fn with_pool<R>(f: impl FnOnce() -> R) -> R {
+    objc2::rc::autoreleasepool(|_| f())
+}
 
 // TODO:
 // - Async Read implementation
@@ -34,7 +62,8 @@ static DISPATCH_QUEUE: LazyLock<DispatchRetained<DispatchQueue>> = LazyLock::new
 pub type IoHidManagerBackend = Arc<IoHidManagerBackendInner>;
 
 pub struct IoHidManagerBackendInner {
-    manager: CFRetained<IOHIDManager>,
+    /// Released inside the pool in `Drop`, after the manager is cancelled.
+    manager: ManuallyDrop<CFRetained<IOHIDManager>>,
     callback_context: *const ManagerCallbackContext,
 }
 
@@ -45,7 +74,7 @@ unsafe impl Sync for IoHidManagerBackendInner {}
 
 impl Default for IoHidManagerBackendInner {
     fn default() -> Self {
-        unsafe {
+        with_pool(|| unsafe {
             trace!("Creating manager");
             let manager = IOHIDManager::new(None, IOHIDManagerOptions::None.bits());
             manager.set_dispatch_queue(&DISPATCH_QUEUE);
@@ -58,10 +87,10 @@ impl Default for IoHidManagerBackendInner {
             manager.activate();
 
             Self {
-                manager,
+                manager: ManuallyDrop::new(manager),
                 callback_context: context as _,
             }
-        }
+        })
     }
 }
 
@@ -73,7 +102,7 @@ impl IoHidManagerBackendInner {
 
 impl Drop for IoHidManagerBackendInner {
     fn drop(&mut self) {
-        unsafe {
+        with_pool(|| unsafe {
             let once = Arc::new(Once::new());
             let block = RcBlock::new({
                 let once = once.clone();
@@ -89,7 +118,10 @@ impl Drop for IoHidManagerBackendInner {
             //SAFETY: Cancel will ensure that the callbacks are never called again, allowing us to free the data structures reference in them
             drop(Box::from_raw(self.callback_context as *mut ManagerCallbackContext));
             self.callback_context = null();
-        }
+
+            //SAFETY: Dropped exactly once, here, and never touched again.
+            ManuallyDrop::drop(&mut self.manager);
+        })
     }
 }
 
@@ -99,7 +131,7 @@ impl Backend for IoHidManagerBackend {
     type FeatureHandle = Arc<DeviceReadWriter>;
 
     async fn enumerate(&self) -> HidResult<DeviceInfoStream> {
-        let device_infos = unsafe {
+        let device_infos = with_pool(|| unsafe {
             let device_set = self.manager.devices().expect("Failed to get devices");
             let mut devices: Vec<NonNull<IOHIDDevice>> = vec![NonNull::dangling(); device_set.count() as usize];
             device_set.values(devices.as_mut_ptr().cast());
@@ -108,7 +140,7 @@ impl Backend for IoHidManagerBackend {
                 .map(|d| get_device_info(d.as_ref()))
                 .try_flatten()
                 .collect::<Vec<_>>()
-        };
+        });
         Ok(iter(device_infos).boxed())
     }
 
@@ -118,9 +150,7 @@ impl Backend for IoHidManagerBackend {
     }
 
     async fn query_info(&self, id: &DeviceId) -> HidResult<Vec<DeviceInfo>> {
-        let device = get_device(id)?;
-        let device_info = get_device_info(&device)?;
-        Ok(device_info)
+        with_pool(|| get_device_info(&*get_device(id)?))
     }
 
     async fn open(&self, id: &DeviceId, read: bool, write: bool) -> HidResult<(Option<Self::Reader>, Option<Self::Writer>)> {
@@ -138,7 +168,7 @@ impl Backend for IoHidManagerBackend {
 
 fn get_device(id: &DeviceId) -> HidResult<CFRetained<IOHIDDevice>> {
     let DeviceId::RegistryEntryId(id) = id;
-    unsafe {
+    with_pool(|| unsafe {
         // kIOMainPortDefault/kIOMasterPortDefault are both named constants for "0"
         //
         // Because kIOMasterPortDefault is deprecated, and kIOMainPortDefault is missing in older SDKs,
@@ -153,7 +183,7 @@ fn get_device(id: &DeviceId) -> HidResult<CFRetained<IOHIDDevice>> {
         // below — so repeated opens don't leak a mach port each time.
         IOObjectRelease(service);
         device.ok_or(HidError::message("Failed to create device"))
-    }
+    })
 }
 
 pub struct DeviceWatcher {
@@ -215,7 +245,9 @@ impl ManagerCallbackContext {
 
     unsafe extern "C-unwind" fn added_callback(context: *mut c_void, _result: IOReturn, _sender: *mut c_void, device: NonNull<IOHIDDevice>) {
         let this: &Self = unsafe { &*(context as *const Self) };
-        match get_device_id(unsafe { device.as_ref() }) {
+        // DISPATCH_QUEUE drains per block too; this keeps the drain next to
+        // the IOKit call rather than relying on how the queue was made.
+        match with_pool(|| get_device_id(unsafe { device.as_ref() })) {
             Ok(id) => {
                 if let Some(prev_id) = this.devices.lock().unwrap().insert(device, id.clone()) {
                     warn!("Device {:p} connected with {:?} already has a stored device id {:?}", device, id, prev_id);
